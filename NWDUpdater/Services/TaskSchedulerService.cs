@@ -3,15 +3,6 @@ using NWDUpdater.Models;
 
 namespace NWDUpdater.Services;
 
-/// <summary>
-/// Creates/manages Windows Scheduled Tasks via PowerShell's ScheduledTasks module.
-/// Using PowerShell (instead of schtasks.exe) lets us enable WakeToRun so the PC
-/// wakes from Sleep (S3) automatically at the scheduled time.
-///
-/// NOTE: Wake from Hibernate (S4) or full shutdown is NOT possible via software alone.
-/// The user must also enable "Allow wake timers" in Windows Power Options →
-/// Sleep → Allow wake timers → Enable (or "Important wake timers only").
-/// </summary>
 public static class TaskSchedulerService
 {
     public static void CreateOrUpdateTask(AppSettings settings, string batPath)
@@ -19,122 +10,124 @@ public static class TaskSchedulerService
         if (!File.Exists(batPath))
             throw new FileNotFoundException($"Batch file not found: {batPath}");
 
-        // Escape single quotes in path for PowerShell
-        string escapedBat = batPath.Replace("'", "''");
-        string taskName   = settings.TaskName.Replace("'", "''");
-        string time       = settings.ScheduleTime;   // "HH:mm"
+        // Write a clean .ps1 file — avoids all escaping issues with -Command
+        string script = $@"
+$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c ""{batPath.Replace("'", "''")}""'
 
-        // Build PowerShell script:
-        //  - Runs as SYSTEM → no interactive session required
-        //  - HighestAvailable → administrator privileges
-        //  - WakeToRun = $true → wakes PC from Sleep (S3)
-        //  - RunOnlyIfNetworkAvailable = $false → runs regardless of network
-        //  - ExecutionTimeLimit 4 hours → enough for large NWF conversions
-        string ps = $@"
-$action   = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c ""{escapedBat}""'
-$trigger  = New-ScheduledTaskTrigger -Daily -At '{time}'
+$trigger = New-ScheduledTaskTrigger -Daily -At '{settings.ScheduleTime}'
+
 $settings = New-ScheduledTaskSettingsSet `
     -WakeToRun `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
-    -RunOnlyIfNetworkAvailable $false `
     -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
     -MultipleInstances IgnoreNew
+
 $principal = New-ScheduledTaskPrincipal `
     -UserId 'SYSTEM' `
     -LogonType ServiceAccount `
     -RunLevel Highest
+
 Register-ScheduledTask `
-    -TaskName '{taskName}' `
+    -TaskName '{settings.TaskName.Replace("'", "''")}' `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
     -Force | Out-Null
+
+Write-Output 'OK'
 ";
+        var (exit, output, error) = RunPs1(script);
 
-        RunPowerShell(ps, out string error);
+        if (exit != 0 || (!output.Contains("OK") && !string.IsNullOrWhiteSpace(error)))
+            throw new InvalidOperationException(
+                string.IsNullOrWhiteSpace(error) ? output : error);
 
-        if (!string.IsNullOrWhiteSpace(error))
-            throw new InvalidOperationException($"Failed to create task:\n{error}");
-
-        LogService.AppendEntry($"Task \"{settings.TaskName}\" created — wakes PC daily at {time}.");
+        LogService.AppendEntry(
+            $"Task \"{settings.TaskName}\" created — wakes PC daily at {settings.ScheduleTime}.");
     }
 
     public static void DeleteTask(string taskName)
     {
-        string escaped = taskName.Replace("'", "''");
-        string ps = $"Unregister-ScheduledTask -TaskName '{escaped}' -Confirm:$false";
-
-        RunPowerShell(ps, out string error);
+        string script = $@"
+try {{
+    Unregister-ScheduledTask -TaskName '{taskName.Replace("'", "''")}' -Confirm:$false
+    Write-Output 'OK'
+}} catch {{
+    Write-Output 'OK'   # not found is fine
+}}
+";
+        var (_, _, error) = RunPs1(script);
 
         if (!string.IsNullOrWhiteSpace(error) &&
             !error.Contains("cannot find", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"Failed to delete task:\n{error}");
+            throw new InvalidOperationException(error);
 
         LogService.AppendEntry($"Task \"{taskName}\" deleted.");
     }
 
     public static string GetTaskStatus(string taskName)
     {
-        string escaped = taskName.Replace("'", "''");
-        string ps = $@"
+        string script = $@"
 try {{
-    $t = Get-ScheduledTask -TaskName '{escaped}' -ErrorAction Stop
-    $t.State
+    $t = Get-ScheduledTask -TaskName '{taskName.Replace("'", "''")}' -ErrorAction Stop
+    Write-Output $t.State
 }} catch {{
-    'NotFound'
+    Write-Output 'NotFound'
 }}
 ";
-        RunPowerShell(ps, out _, out string output);
+        var (_, output, _) = RunPs1(script);
 
-        string state = output.Trim();
-        return state switch
+        return output.Trim() switch
         {
             "Ready"    => "Ready",
             "Running"  => "Running",
             "Disabled" => "Disabled",
-            "NotFound" => "Not Found",
             _          => "Not Found"
         };
     }
 
     public static void RunTaskNow(string taskName)
     {
-        string escaped = taskName.Replace("'", "''");
-        string ps = $"Start-ScheduledTask -TaskName '{escaped}'";
+        string script = $@"
+Start-ScheduledTask -TaskName '{taskName.Replace("'", "''")}'
+Write-Output 'OK'
+";
+        var (exit, _, error) = RunPs1(script);
 
-        RunPowerShell(ps, out string error);
-
-        if (!string.IsNullOrWhiteSpace(error))
-            throw new InvalidOperationException($"Failed to run task:\n{error}");
+        if (exit != 0 && !string.IsNullOrWhiteSpace(error))
+            throw new InvalidOperationException(error);
 
         LogService.AppendEntry($"Task \"{taskName}\" triggered manually.");
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────────
-
-    private static void RunPowerShell(string script, out string error, out string output)
+    // ── helper: write script to temp .ps1, run, clean up ────────────────────
+    private static (int exit, string output, string error) RunPs1(string script)
     {
-        using var p = new Process();
-        p.StartInfo = new ProcessStartInfo
+        string tmp = Path.Combine(Path.GetTempPath(), $"nwdupdater_{Guid.NewGuid():N}.ps1");
+        try
         {
-            FileName               = "powershell.exe",
-            Arguments              = $"-NonInteractive -NoProfile -ExecutionPolicy Bypass -Command \"{EscapeArg(script)}\"",
-            UseShellExecute        = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-            CreateNoWindow         = true,
-            Verb                   = "runas"   // elevate if needed
-        };
-        p.Start();
-        output = p.StandardOutput.ReadToEnd().Trim();
-        error  = p.StandardError.ReadToEnd().Trim();
-        p.WaitForExit(30_000);
+            File.WriteAllText(tmp, script, System.Text.Encoding.UTF8);
+
+            using var p = new Process();
+            p.StartInfo = new ProcessStartInfo
+            {
+                FileName               = "powershell.exe",
+                Arguments              = $"-NonInteractive -NoProfile -ExecutionPolicy Bypass -File \"{tmp}\"",
+                UseShellExecute        = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                CreateNoWindow         = true
+            };
+            p.Start();
+            string output = p.StandardOutput.ReadToEnd().Trim();
+            string error  = p.StandardError.ReadToEnd().Trim();
+            p.WaitForExit(30_000);
+            return (p.ExitCode, output, error);
+        }
+        finally
+        {
+            try { File.Delete(tmp); } catch { }
+        }
     }
-
-    private static void RunPowerShell(string script, out string error)
-        => RunPowerShell(script, out error, out _);
-
-    private static string EscapeArg(string script)
-        => script.Replace("\"", "\\\"").Replace(Environment.NewLine, " ");
 }
